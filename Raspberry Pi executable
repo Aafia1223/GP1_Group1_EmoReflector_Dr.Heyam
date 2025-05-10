@@ -1,0 +1,157 @@
+import cv2
+import subprocess
+import os
+import time
+import smtplib
+from email.message import EmailMessage
+import random
+from datetime import datetime, timedelta
+import pickle
+import numpy as np
+
+# Email config
+EMAIL_ADDRESS = "emoreflector@gmail.com"
+EMAIL_PASSWORD = "yxxq ecgg bkwt fkjz"
+RECEIVER_EMAIL = "" # Add your email
+
+# Emotion tracking
+emotion_counts = {"happy": 0, "neutral": 0, "sad": 0, "angry": 0, "surprised": 0}
+start_date = datetime.now()
+week_duration = timedelta(days=7)
+data_file = "emotion_data.pkl"
+
+# Load previous emotion data if it exists
+if os.path.exists(data_file):
+    with open(data_file, "rb") as f:
+        data = pickle.load(f)
+        emotion_counts = data.get("emotion_counts", emotion_counts)
+        start_date = data.get("start_date", start_date)
+
+# Load ONNX model using OpenCV
+model = cv2.dnn.readNetFromONNX("model.onnx")
+
+# Emotion labels must match model output order
+emotion_labels = ["Surprise", "Sad", "Happy", "Neutral", "Angry"]
+
+# Advice messages
+angry_advice = ["Take deep breaths.", "Step away and cool down.", "Try to express yourself calmly."]
+sad_advice = ["Call a friend.", "Take a walk outside.", "Write your thoughts down."]
+
+# Save emotion data
+def save_data():
+    with open(data_file, "wb") as f:
+        pickle.dump({"emotion_counts": emotion_counts, "start_date": start_date}, f)
+
+# Send a weekly plain-text report email
+def send_weekly_report():
+    try:
+        negative = emotion_counts["angry"] + emotion_counts["sad"]
+        non_negative = sum(emotion_counts.values()) - negative
+
+        msg = EmailMessage()
+        msg["Subject"] = "Weekly Emotion Report"
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = RECEIVER_EMAIL
+
+        body = (
+            f"Here is this week's emotion report:\n\n" +
+            "\n".join(f"{k.capitalize()}: {v}" for k, v in emotion_counts.items()) +
+            f"\n\nNegative Emotions (Angry + Sad): {negative}" +
+            f"\nNon-Negative Emotions: {non_negative}" +
+            "\n\nRegards,\nEmotion Reflector"
+        )
+
+        msg.set_content(body)
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        print("Weekly report email sent.")
+
+    except Exception as e:
+        print(f"Weekly email error: {e}")
+
+# Send alert email for negative emotions
+def send_alert_email(emotion):
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = "Alert: Negative Emotion Detected"
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = RECEIVER_EMAIL
+        msg.set_content(f"The detected emotion is: {emotion}. Please check on the elderly.")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        print("Alert email sent.")
+
+    except Exception as e:
+        print(f"Alert email error: {e}")
+
+# Main loop
+while True:
+    try:
+        # Take a photo
+        subprocess.run(["libcamera-still", "-o", "captured_image.jpg", "--width", "1640", "--height", "1232"], check=True)
+        img = cv2.imread("captured_image.jpg")
+
+        # Convert to grayscale for face detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier("/home/pi/.config/opencv/haarcascade_frontalface_default.xml")
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+
+        if len(faces) > 0:
+            os.system('espeak "Face detected successfully."')
+
+            for (x, y, w, h) in faces:
+                face = img[y:y+h, x:x+w]
+                print("Face shape:", face.shape)
+
+                # Prepare image for input to the model
+                blob = cv2.dnn.blobFromImage(face, scalefactor=1/255.0, size=(64, 64), mean=(0, 0, 0), swapRB=True, crop=False)
+                model.setInput(blob)
+
+                # Forward pass with dual-output
+                #outputs = model.forward()
+                #emotion_pred = outputs[0].squeeze()  # First output: emotion probabilities
+                #negative_pred = outputs[1].squeeze()  # Second output: negative emotion (binary)
+
+                output_names = model.getUnconnectedOutLayersNames()
+                print("ONNX model output names:", model.getUnconnectedOutLayersNames())
+
+                outputs = model.forward(output_names)
+                emotion_pred = outputs[0].squeeze()  # First output: emotion probabilities
+                negative_pred = outputs[1].squeeze() 
+                emotion_idx = int(np.argmax(emotion_pred))  # Get index of max emotion
+                is_negative = negative_pred > 0.5  # Binary threshold for negative emotion
+                emotion = emotion_labels[emotion_idx]
+
+                print(f"Detected Emotion: {emotion} | Negative: {is_negative}")
+
+                # Track emotion
+                if emotion in emotion_counts:
+                    emotion_counts[emotion] += 1
+                    save_data()
+
+                # Speak advice
+                if emotion == "Angry":
+                    os.system(f'espeak "{random.choice(angry_advice)}"')
+                elif emotion == "Sad":
+                    os.system(f'espeak "{random.choice(sad_advice)}"')
+
+                # Send alert email
+                if is_negative:
+                    send_alert_email(emotion)
+                    
+                break
+
+        # Weekly report check
+        if datetime.now() >= start_date + week_duration:
+            send_weekly_report()
+            start_date = datetime.now()
+            emotion_counts = {k: 0 for k in emotion_counts}
+            save_data()
+
+    except Exception as e:
+        print(f"Runtime error: {e}")
+
+    time.sleep(30)  # Wait 30 second
